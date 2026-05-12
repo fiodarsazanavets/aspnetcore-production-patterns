@@ -1,0 +1,32 @@
+@host = https://localhost:7180
+
+POST {{host}}/orders
+Content-Type: application/json
+Idempotency-Key: demo-order-001
+
+{
+  "customerId": "customer-123",
+  "lines": [
+    { "sku": "hardening-course", "quantity": 1 }
+  ]
+}
+
+### Inject a slow dependency
+POST {{host}}/diagnostics/faults
+Content-Type: application/json
+
+{
+  "shippingUnavailable": false,
+  "shippingDelayMs": 3000,
+  "forceReadinessFailure": false
+}
+
+### Clear faults
+POST {{host}}/diagnostics/faults
+Content-Type: application/json
+
+{
+  "shippingUnavailable": false,
+  "shippingDelayMs": 0,
+  "forceReadinessFailure": false
+}
