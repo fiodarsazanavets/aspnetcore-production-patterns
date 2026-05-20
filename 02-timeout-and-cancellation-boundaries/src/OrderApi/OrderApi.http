@@ -21,18 +21,8 @@ Content-Type: application/json
   "forceReadinessFailure": false
 }
 
-### Clear faults
-POST {{host}}/diagnostics/faults
-Content-Type: application/json
-
-{
-  "shippingUnavailable": false,
-  "shippingDelayMs": 0,
-  "forceReadinessFailure": false
-}
-
 ### Make shipping dependency slow
-POST {{OrderApi_HostAddress}}/diagnostics/faults
+POST {{host}}/diagnostics/faults
 Content-Type: application/json
 
 {
@@ -41,27 +31,12 @@ Content-Type: application/json
   "forceReadinessFailure": false
 }
 
-### Try creating an order while shipping is slow
-POST {{OrderApi_HostAddress}}/orders
-Content-Type: application/json
-Idempotency-Key: timeout-demo-001
-
-{
-  "customerId": "f6e92b94-4967-4e5c-b78f-734f88d8673d",
-  "lines": [
-    {
-      "sku": "COURSE-001",
-      "quantity": 2
-    }
-  ]
-}
-
-### Reset faults
-POST {{OrderApi_HostAddress}}/diagnostics/faults
+### Clear faults
+POST {{host}}/diagnostics/faults
 Content-Type: application/json
 
 {
-  "shippingDelayMs": 0,
   "shippingUnavailable": false,
+  "shippingDelayMs": 0,
   "forceReadinessFailure": false
 }
