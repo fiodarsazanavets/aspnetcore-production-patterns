@@ -6,6 +6,10 @@ using OrderApi.Diagnostics;
 using OrderApi.Exceptions;
 using OrderApi.Infrastructure;
 using OrderApi.Services;
+using Polly;
+using Polly.Contrib.WaitAndRetry;
+using Polly.Extensions.Http;
+using System.Net;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -21,25 +25,42 @@ builder.Services.AddScoped<OrderWorkflow>();
 builder.Services.Configure<ShippingOptions>(
     builder.Configuration.GetSection("Shipping"));
 
-builder.Services.AddHttpClient<IShippingGateway, ShippingGateway>(client =>
-{
-    client.BaseAddress = new Uri(builder.Configuration["Shipping:BaseUrl"] ?? "https://localhost:5009");
-    client.Timeout = Timeout.InfiniteTimeSpan;
-});
+builder.Services
+    .AddHttpClient<IShippingGateway, ShippingGateway>(client =>
+    {
+        client.BaseAddress = client.BaseAddress = new Uri(builder.Configuration["Shipping:BaseUrl"] ?? "https://localhost:5009");
+        client.Timeout = Timeout.InfiniteTimeSpan;
+    })
+    .AddPolicyHandler((services, _) =>
+    {
+        var options =
+            services.GetRequiredService<IOptions<ShippingOptions>>().Value;
 
-builder.Services.AddScoped<IShippingGateway>(services =>
-{
-    var httpClientFactory = services.GetRequiredService<IHttpClientFactory>();
+        var logger =
+            services.GetRequiredService<ILoggerFactory>()
+                .CreateLogger("PollyRetry");
 
-    var inner = ActivatorUtilities.CreateInstance<ShippingGateway>(
-        services,
-        httpClientFactory.CreateClient(nameof(ShippingGateway)));
+        var delays = Backoff.DecorrelatedJitterBackoffV2(
+            medianFirstRetryDelay:
+                TimeSpan.FromMilliseconds(options.BaseRetryDelayMilliseconds),
+            retryCount: options.MaxRetryAttempts - 1);
 
-    return new ManualRetryShippingGateway(
-        inner,
-        services.GetRequiredService<IOptions<ShippingOptions>>(),
-        services.GetRequiredService<ILogger<ManualRetryShippingGateway>>());
-});
+        return HttpPolicyExtensions
+            .HandleTransientHttpError()
+            .OrResult(response =>
+                response.StatusCode == HttpStatusCode.ServiceUnavailable)
+            .WaitAndRetryAsync(
+                delays,
+                onRetry: (outcome, delay, attempt, _) =>
+                {
+                    logger.LogWarning(
+                        outcome.Exception,
+                        "Retry attempt {Attempt} after {DelayMilliseconds} ms. StatusCode: {StatusCode}",
+                        attempt,
+                        delay.TotalMilliseconds,
+                        outcome.Result?.StatusCode);
+                });
+    });
 
 var app = builder.Build();
 
@@ -118,6 +139,35 @@ app.MapGet("/diagnostics/readiness", (IFaultSwitches faults) =>
 {
     var ready = !faults.Current.ForceReadinessFailure;
     return ready ? Results.Ok(new { status = "ready" }) : Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+});
+
+// Fake external endpoint
+
+app.MapGet("/shipping/quote", (
+    IFaultSwitches faults) =>
+{
+    var current = faults.Current;
+
+    if (current.ShippingDelayMs > 0)
+    {
+        Thread.Sleep(current.ShippingDelayMs);
+    }
+
+    if (faults.ShouldFailShippingTransiently())
+    {
+        return Results.StatusCode(503);
+    }
+
+    if (current.ShippingUnavailable)
+    {
+        return Results.StatusCode(500);
+    }
+
+    return Results.Ok(new
+    {
+        carrier = "DemoCarrier",
+        price = 9.99m
+    });
 });
 
 app.Run();
