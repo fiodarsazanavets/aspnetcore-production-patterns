@@ -7,6 +7,7 @@ using OrderApi.Exceptions;
 using OrderApi.Infrastructure;
 using OrderApi.Services;
 using Polly;
+using Polly.CircuitBreaker;
 using Polly.Contrib.WaitAndRetry;
 using Polly.Extensions.Http;
 using System.Net;
@@ -24,6 +25,8 @@ builder.Services.AddSingleton<IRequestCoalescer, InMemoryRequestCoalescer>();
 builder.Services.AddScoped<OrderWorkflow>();
 builder.Services.Configure<ShippingOptions>(
     builder.Configuration.GetSection("Shipping"));
+
+builder.Services.AddSingleton<IShippingFallbackProvider, ShippingFallbackProvider>();
 
 builder.Services
     .AddHttpClient<IShippingGateway, ShippingGateway>(client =>
@@ -60,7 +63,38 @@ builder.Services
                         delay.TotalMilliseconds,
                         outcome.Result?.StatusCode);
                 });
-    });
+    })
+    .AddPolicyHandler((services, _) => GetCircuitBreakerPolicy(services));
+
+static IAsyncPolicy<HttpResponseMessage> GetCircuitBreakerPolicy(IServiceProvider services)
+{
+    var options = services.GetRequiredService<IOptions<ShippingOptions>>().Value;
+
+    var logger = services
+        .GetRequiredService<ILoggerFactory>()
+        .CreateLogger("PollyCircuitBreaker");
+
+    return HttpPolicyExtensions
+        .HandleTransientHttpError()
+        .CircuitBreakerAsync(
+            handledEventsAllowedBeforeBreaking: options.CircuitBreakAfterFailures,
+            durationOfBreak: TimeSpan.FromSeconds(options.CircuitBreakDurationSeconds),
+            onBreak: (outcome, breakDelay) =>
+            {
+                logger.LogWarning(
+                    outcome.Exception,
+                    "Shipping circuit opened for {BreakDelaySeconds} seconds.",
+                    breakDelay.TotalSeconds);
+            },
+            onReset: () =>
+            {
+                logger.LogInformation("Shipping circuit reset.");
+            },
+            onHalfOpen: () =>
+            {
+                logger.LogInformation("Shipping circuit is half-open. The next call is a probe.");
+            });
+}
 
 var app = builder.Build();
 
@@ -115,6 +149,13 @@ app.MapPost("/orders", async Task<Results<Created<OrderResponse>,
         return TypedResults.Problem(
             title: "Shipping dependency unavailable.",
             detail: "The shipping dependency failed after the allowed retry attempts.",
+            statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+    catch (BrokenCircuitException)
+    {
+        return TypedResults.Problem(
+            title: "Shipping dependency circuit is open.",
+            detail: "The shipping dependency is currently protected by an open circuit breaker. Try again later.",
             statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 });
@@ -173,3 +214,4 @@ app.MapGet("/shipping/quote", (
 app.Run();
 
 public partial class Program;
+

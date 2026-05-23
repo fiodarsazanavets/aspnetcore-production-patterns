@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Http.HttpResults;
+using Microsoft.Extensions.Http.Resilience;
 using Microsoft.Extensions.Options;
 using OrderApi.Config;
 using OrderApi.Contracts;
@@ -7,8 +8,7 @@ using OrderApi.Exceptions;
 using OrderApi.Infrastructure;
 using OrderApi.Services;
 using Polly;
-using Polly.Contrib.WaitAndRetry;
-using Polly.Extensions.Http;
+using Polly.CircuitBreaker;
 using System.Net;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -25,42 +25,17 @@ builder.Services.AddScoped<OrderWorkflow>();
 builder.Services.Configure<ShippingOptions>(
     builder.Configuration.GetSection("Shipping"));
 
+builder.Services.AddSingleton<IShippingFallbackProvider, ShippingFallbackProvider>();
+
 builder.Services
     .AddHttpClient<IShippingGateway, ShippingGateway>(client =>
     {
-        client.BaseAddress = new Uri(builder.Configuration["Shipping:BaseUrl"] ?? "https://localhost:5009");
+        client.BaseAddress = new Uri(
+            builder.Configuration["Shipping:BaseUrl"] ?? "https://localhost:7180");
+
         client.Timeout = Timeout.InfiniteTimeSpan;
     })
-    .AddPolicyHandler((services, _) =>
-    {
-        var options =
-            services.GetRequiredService<IOptions<ShippingOptions>>().Value;
-
-        var logger =
-            services.GetRequiredService<ILoggerFactory>()
-                .CreateLogger("PollyRetry");
-
-        var delays = Backoff.DecorrelatedJitterBackoffV2(
-            medianFirstRetryDelay:
-                TimeSpan.FromMilliseconds(options.BaseRetryDelayMilliseconds),
-            retryCount: options.MaxRetryAttempts - 1);
-
-        return HttpPolicyExtensions
-            .HandleTransientHttpError()
-            .OrResult(response =>
-                response.StatusCode == HttpStatusCode.ServiceUnavailable)
-            .WaitAndRetryAsync(
-                delays,
-                onRetry: (outcome, delay, attempt, _) =>
-                {
-                    logger.LogWarning(
-                        outcome.Exception,
-                        "Retry attempt {Attempt} after {DelayMilliseconds} ms. StatusCode: {StatusCode}",
-                        attempt,
-                        delay.TotalMilliseconds,
-                        outcome.Result?.StatusCode);
-                });
-    });
+    .AddStandardResilienceHandler();
 
 var app = builder.Build();
 
@@ -115,6 +90,13 @@ app.MapPost("/orders", async Task<Results<Created<OrderResponse>,
         return TypedResults.Problem(
             title: "Shipping dependency unavailable.",
             detail: "The shipping dependency failed after the allowed retry attempts.",
+            statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+    catch (BrokenCircuitException)
+    {
+        return TypedResults.Problem(
+            title: "Shipping dependency circuit is open.",
+            detail: "The shipping dependency is currently protected by an open circuit breaker. Try again later.",
             statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 });
@@ -173,3 +155,4 @@ app.MapGet("/shipping/quote", (
 app.Run();
 
 public partial class Program;
+

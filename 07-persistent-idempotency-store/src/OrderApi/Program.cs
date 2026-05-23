@@ -1,15 +1,13 @@
 using Microsoft.AspNetCore.Http.HttpResults;
-using Microsoft.Extensions.Options;
+using Microsoft.EntityFrameworkCore;
 using OrderApi.Config;
 using OrderApi.Contracts;
 using OrderApi.Diagnostics;
 using OrderApi.Exceptions;
 using OrderApi.Infrastructure;
+using OrderApi.Infrastructure.Persistence;
 using OrderApi.Services;
-using Polly;
-using Polly.Contrib.WaitAndRetry;
-using Polly.Extensions.Http;
-using System.Net;
+using Polly.CircuitBreaker;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -19,50 +17,43 @@ builder.Services.AddSwaggerGen();
 builder.Services.AddMemoryCache();
 builder.Services.AddSingleton<IFaultSwitches, InMemoryFaultSwitches>();
 builder.Services.AddSingleton<IOrderStore, InMemoryOrderStore>();
-builder.Services.AddSingleton<IIdempotencyStore, InMemoryIdempotencyStore>();
 builder.Services.AddSingleton<IRequestCoalescer, InMemoryRequestCoalescer>();
 builder.Services.AddScoped<OrderWorkflow>();
 builder.Services.Configure<ShippingOptions>(
     builder.Configuration.GetSection("Shipping"));
 
+builder.Services.AddDbContextFactory<OrdersDbContext>(options =>
+{
+    options.UseSqlite(
+        builder.Configuration.GetConnectionString("Orders"));
+});
+
+builder.Services.AddScoped<IIdempotencyStore, PersistentIdempotencyStore>();
+
+builder.Services.AddSingleton<IShippingFallbackProvider, ShippingFallbackProvider>();
+
 builder.Services
     .AddHttpClient<IShippingGateway, ShippingGateway>(client =>
     {
-        client.BaseAddress = new Uri(builder.Configuration["Shipping:BaseUrl"] ?? "https://localhost:5009");
+        client.BaseAddress = new Uri(
+            builder.Configuration["Shipping:BaseUrl"] ?? "https://localhost:7180");
+
         client.Timeout = Timeout.InfiniteTimeSpan;
     })
-    .AddPolicyHandler((services, _) =>
-    {
-        var options =
-            services.GetRequiredService<IOptions<ShippingOptions>>().Value;
-
-        var logger =
-            services.GetRequiredService<ILoggerFactory>()
-                .CreateLogger("PollyRetry");
-
-        var delays = Backoff.DecorrelatedJitterBackoffV2(
-            medianFirstRetryDelay:
-                TimeSpan.FromMilliseconds(options.BaseRetryDelayMilliseconds),
-            retryCount: options.MaxRetryAttempts - 1);
-
-        return HttpPolicyExtensions
-            .HandleTransientHttpError()
-            .OrResult(response =>
-                response.StatusCode == HttpStatusCode.ServiceUnavailable)
-            .WaitAndRetryAsync(
-                delays,
-                onRetry: (outcome, delay, attempt, _) =>
-                {
-                    logger.LogWarning(
-                        outcome.Exception,
-                        "Retry attempt {Attempt} after {DelayMilliseconds} ms. StatusCode: {StatusCode}",
-                        attempt,
-                        delay.TotalMilliseconds,
-                        outcome.Result?.StatusCode);
-                });
-    });
+    .AddStandardResilienceHandler();
 
 var app = builder.Build();
+
+using (var scope = app.Services.CreateScope())
+{
+    var dbContextFactory =
+        scope.ServiceProvider.GetRequiredService<IDbContextFactory<OrdersDbContext>>();
+
+    await using var dbContext =
+        await dbContextFactory.CreateDbContextAsync();
+
+    await dbContext.Database.EnsureCreatedAsync();
+}
 
 app.UseExceptionHandler();
 
@@ -115,6 +106,13 @@ app.MapPost("/orders", async Task<Results<Created<OrderResponse>,
         return TypedResults.Problem(
             title: "Shipping dependency unavailable.",
             detail: "The shipping dependency failed after the allowed retry attempts.",
+            statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+    catch (BrokenCircuitException)
+    {
+        return TypedResults.Problem(
+            title: "Shipping dependency circuit is open.",
+            detail: "The shipping dependency is currently protected by an open circuit breaker. Try again later.",
             statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 });
@@ -173,3 +171,4 @@ app.MapGet("/shipping/quote", (
 app.Run();
 
 public partial class Program;
+

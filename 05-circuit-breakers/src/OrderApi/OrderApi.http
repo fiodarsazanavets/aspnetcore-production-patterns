@@ -1,0 +1,63 @@
+@host = https://localhost:7180
+
+### Make shipping permanently unavailable
+POST {{host}}/diagnostics/faults
+Content-Type: application/json
+
+{
+  "shippingDelayMs": 0,
+  "shippingUnavailable": true,
+  "forceReadinessFailure": false,
+  "shippingTransientFailuresBeforeSuccess": 0
+}
+
+### Create order 1 - dependency failure contributes to circuit opening
+POST {{host}}/orders
+Content-Type: application/json
+Idempotency-Key: circuit-demo-001
+
+{
+  "customerId": "f6e92b94-4967-4e5c-b78f-734f88d8673d",
+  "lines": [{ "sku": "COURSE-001", "quantity": 2 }]
+}
+
+### Create order 2
+POST {{host}}/orders
+Content-Type: application/json
+Idempotency-Key: circuit-demo-002
+
+{
+  "customerId": "f6e92b94-4967-4e5c-b78f-734f88d8673d",
+  "lines": [{ "sku": "COURSE-001", "quantity": 2 }]
+}
+
+### Create order 3 - circuit should open around here
+POST {{host}}/orders
+Content-Type: application/json
+Idempotency-Key: circuit-demo-003
+
+{
+  "customerId": "f6e92b94-4967-4e5c-b78f-734f88d8673d",
+  "lines": [{ "sku": "COURSE-001", "quantity": 2 }]
+}
+
+### Create order 4 - should be protected by open circuit and fallback
+POST {{host}}/orders
+Content-Type: application/json
+Idempotency-Key: circuit-demo-004
+
+{
+  "customerId": "f6e92b94-4967-4e5c-b78f-734f88d8673d",
+  "lines": [{ "sku": "COURSE-001", "quantity": 2 }]
+}
+
+### Reset dependency
+POST {{host}}/diagnostics/faults
+Content-Type: application/json
+
+{
+  "shippingDelayMs": 0,
+  "shippingUnavailable": false,
+  "forceReadinessFailure": false,
+  "shippingTransientFailuresBeforeSuccess": 0
+}
