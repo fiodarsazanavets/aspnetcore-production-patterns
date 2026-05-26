@@ -1,15 +1,13 @@
 using Microsoft.AspNetCore.Http.HttpResults;
-using Microsoft.Extensions.Http.Resilience;
-using Microsoft.Extensions.Options;
+using Microsoft.EntityFrameworkCore;
 using OrderApi.Config;
 using OrderApi.Contracts;
 using OrderApi.Diagnostics;
 using OrderApi.Exceptions;
 using OrderApi.Infrastructure;
+using OrderApi.Infrastructure.Persistence;
 using OrderApi.Services;
-using Polly;
 using Polly.CircuitBreaker;
-using System.Net;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -18,14 +16,31 @@ builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 builder.Services.AddMemoryCache();
 builder.Services.AddSingleton<IFaultSwitches, InMemoryFaultSwitches>();
-builder.Services.AddSingleton<IOrderStore, InMemoryOrderStore>();
-builder.Services.AddSingleton<IIdempotencyStore, InMemoryIdempotencyStore>();
+builder.Services.AddScoped<IOrderStore, PersistentOrderStore>();
 builder.Services.AddSingleton<IRequestCoalescer, InMemoryRequestCoalescer>();
 builder.Services.AddScoped<OrderWorkflow>();
 builder.Services.Configure<ShippingOptions>(
     builder.Configuration.GetSection("Shipping"));
+builder.Services.Configure<OrderCacheOptions>(
+    builder.Configuration.GetSection("OrderCache"));
+
+builder.Services.AddScoped<CachedOrderReader>();
+builder.Services.AddScoped<OrderSummaryService>();
+
+builder.Services.AddDbContextFactory<OrdersDbContext>(options =>
+{
+    options.UseSqlite(
+        builder.Configuration.GetConnectionString("Orders"));
+});
+
+builder.Services.AddScoped<IIdempotencyStore, PersistentIdempotencyStore>();
 
 builder.Services.AddSingleton<IShippingFallbackProvider, ShippingFallbackProvider>();
+
+builder.Services.AddScoped<IBackgroundJobStore, PersistentBackgroundJobStore>();
+builder.Services.AddScoped<IOrderConfirmationSender, PersistentOrderConfirmationSender>();
+builder.Services.AddHostedService<OrderConfirmationWorker>();
+builder.Services.AddSingleton<LastKnownOrderSnapshot>();
 
 builder.Services
     .AddHttpClient<IShippingGateway, ShippingGateway>(client =>
@@ -37,7 +52,28 @@ builder.Services
     })
     .AddStandardResilienceHandler();
 
+builder.Services.AddOutputCache(options =>
+{
+    options.AddPolicy("OrderSummaryOutput", policy =>
+    {
+        policy.Expire(TimeSpan.FromSeconds(20));
+    });
+});
+
+builder.Services.AddHybridCache();
+
 var app = builder.Build();
+
+using (var scope = app.Services.CreateScope())
+{
+    var dbContextFactory =
+        scope.ServiceProvider.GetRequiredService<IDbContextFactory<OrdersDbContext>>();
+
+    await using var dbContext =
+        await dbContextFactory.CreateDbContextAsync();
+
+    await dbContext.Database.EnsureCreatedAsync();
+}
 
 app.UseExceptionHandler();
 
@@ -46,6 +82,8 @@ if (app.Environment.IsDevelopment())
     app.UseSwagger();
     app.UseSwaggerUI();
 }
+
+app.UseOutputCache();
 
 app.MapGet("/", () => Results.Redirect("/swagger"));
 
@@ -64,8 +102,7 @@ app.MapPost("/orders", async Task<Results<Created<OrderResponse>,
     var idempotencyKey = httpContext.Request.Headers["Idempotency-Key"].ToString();
     if (string.IsNullOrWhiteSpace(idempotencyKey))
     {
-        return TypedResults.BadRequest(
-            new ProblemDetailsResponse("Provide an Idempotency-Key header for write operations."));
+        return TypedResults.BadRequest(new ProblemDetailsResponse("Provide an Idempotency-Key header for write operations."));
     }
 
     try
@@ -102,14 +139,51 @@ app.MapPost("/orders", async Task<Results<Created<OrderResponse>,
     }
 });
 
-app.MapGet("/orders/{orderId:guid}", async Task<Results<Ok<OrderResponse>, NotFound>> (
+app.MapGet("/orders/{orderId:guid}", async (
     Guid orderId,
-    IOrderStore store,
-    IRequestCoalescer coalescer,
+    CachedOrderReader reader,
     CancellationToken cancellationToken) =>
 {
-    var order = await coalescer.RunOnceAsync($"order:{orderId}", () => store.FindAsync(orderId, cancellationToken));
-    return order is null ? TypedResults.NotFound() : TypedResults.Ok(order);
+    var order = await reader.GetOrderAsync(orderId, cancellationToken);
+
+    return order is null
+        ? Results.NotFound()
+        : Results.Ok(order);
+});
+
+app.MapGet("/orders/{orderId:guid}/summary", async (
+    Guid orderId,
+    OrderSummaryService summaries,
+    CancellationToken cancellationToken) =>
+{
+    var summary = await summaries.GetSummaryAsync(orderId, cancellationToken);
+
+    return summary is null
+        ? Results.NotFound()
+        : Results.Ok(summary);
+});
+
+app.MapGet("/orders/{orderId:guid}/summary-output", async (
+    Guid orderId,
+    OrderSummaryService summaries,
+    CancellationToken cancellationToken) =>
+{
+    var summary = await summaries.GetSummaryAsync(orderId, cancellationToken);
+
+    return summary is null
+        ? Results.NotFound()
+        : Results.Ok(summary);
+})
+.CacheOutput("OrderSummaryOutput");
+
+app.MapPost("/orders/{orderId:guid}/refresh-cache", async (
+    Guid orderId,
+    CachedOrderReader reader,
+    CancellationToken cancellationToken) =>
+{
+    await reader.InvalidateAsync(orderId, cancellationToken);
+
+    return Results.NoContent();
 });
 
 app.MapPost("/diagnostics/faults", (FaultConfiguration request, IFaultSwitches faults) =>
@@ -123,6 +197,49 @@ app.MapGet("/diagnostics/readiness", (IFaultSwitches faults) =>
     var ready = !faults.Current.ForceReadinessFailure;
     return ready ? Results.Ok(new { status = "ready" }) : Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
 });
+
+app.MapGet("/diagnostics/background-jobs", async (
+    IDbContextFactory<OrdersDbContext> dbContextFactory,
+    CancellationToken cancellationToken) =>
+{
+    await using var dbContext =
+        await dbContextFactory.CreateDbContextAsync(cancellationToken);
+
+    var jobs = await dbContext.BackgroundJobs
+        .OrderByDescending(x => x.CreatedAt)
+        .Take(20)
+        .Select(x => new
+        {
+            x.Id,
+            x.JobType,
+            x.IdempotencyKey,
+            x.State,
+            x.AttemptCount,
+            x.CreatedAt,
+            x.LockedUntil,
+            x.CompletedAt,
+            x.LastError
+        })
+        .ToListAsync(cancellationToken);
+
+    return Results.Ok(jobs);
+});
+
+app.MapGet("/diagnostics/order-confirmations", async (
+    IDbContextFactory<OrdersDbContext> dbContextFactory,
+    CancellationToken cancellationToken) =>
+{
+    await using var dbContext =
+        await dbContextFactory.CreateDbContextAsync(cancellationToken);
+
+    var confirmations = await dbContext.OrderConfirmations
+        .OrderByDescending(x => x.SentAt)
+        .Take(20)
+        .ToListAsync(cancellationToken);
+
+    return Results.Ok(confirmations);
+});
+
 
 // Fake external endpoint
 

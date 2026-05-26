@@ -17,7 +17,7 @@ Content-Type: application/json
 Idempotency-Key: circuit-demo-001
 
 {
-  "customerId": "f6e92b94-4967-4e5c-b78f-734f88d8673d",
+  "customerId": "d6e92b94-4967-4e5c-b78f-734f88d8673d",
   "lines": [{ "sku": "COURSE-001", "quantity": 2 }]
 }
 

@@ -1,0 +1,32 @@
+@host = https://localhost:7180
+@orderId = 52787489-bf83-417b-859f-9d0d9f2c25f3
+
+### Create an order
+POST {{host}}/orders
+Content-Type: application/json
+Idempotency-Key: cache-demo-001
+
+{
+  "customerId": "f6e92b94-4967-4e5c-b78f-734f88d8673d",
+  "lines": [
+    { "sku": "COURSE-001", "quantity": 2 }
+  ]
+}
+
+### Read order - first call loads from database
+GET {{host}}/orders/{{orderId}}
+
+### Read order - second call should hit HybridCache
+GET {{host}}/orders/{{orderId}}
+
+### Expensive summary - first call computes
+GET {{host}}/orders/{{orderId}}/summary
+
+### Expensive summary - subsequent call should use cache
+GET {{host}}/orders/{{orderId}}/summary
+
+### Output cached summary
+GET {{host}}/orders/{{orderId}}/summary-output
+
+### Invalidate order and summary cache
+POST {{host}}/orders/{{orderId}}/refresh-cache
