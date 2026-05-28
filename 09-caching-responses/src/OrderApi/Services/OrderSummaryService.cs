@@ -18,7 +18,7 @@ public sealed class OrderSummaryService(
             async token =>
             {
                 logger.LogInformation(
-                    "Computing expensive summary for order {OrderId}.",
+                    "Computing summary for order {OrderId}.",
                     orderId);
 
                 var order = await orderStore.FindAsync(orderId, token);
