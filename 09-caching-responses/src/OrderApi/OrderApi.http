@@ -25,8 +25,20 @@ GET {{host}}/orders/{{orderId}}/summary
 ### Expensive summary - subsequent call should use cache
 GET {{host}}/orders/{{orderId}}/summary
 
-### Output cached summary
+### Output cached summary - first call
+GET {{host}}/orders/{{orderId}}/summary-output
+
+### Output cached summary - read from cache
 GET {{host}}/orders/{{orderId}}/summary-output
 
 ### Invalidate order and summary cache
 POST {{host}}/orders/{{orderId}}/refresh-cache
+
+### Invalidate order and summary output cache
+POST {{host}}/orders/{{orderId}}/refresh-output-cache
+
+### Expensive summary after cache has been emptied
+GET {{host}}/orders/{{orderId}}/summary-output
+
+### Hits output cache again
+GET {{host}}/orders/{{orderId}}/summary-output

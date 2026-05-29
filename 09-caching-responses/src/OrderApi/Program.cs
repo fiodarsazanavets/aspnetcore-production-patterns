@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Http.HttpResults;
+using Microsoft.AspNetCore.OutputCaching;
 using Microsoft.EntityFrameworkCore;
 using OrderApi.Config;
 using OrderApi.Contracts;
@@ -56,7 +57,9 @@ builder.Services.AddOutputCache(options =>
 {
     options.AddPolicy("OrderSummaryOutput", policy =>
     {
-        policy.Expire(TimeSpan.FromSeconds(20));
+        policy.Expire(TimeSpan.FromSeconds(20))
+            .SetVaryByRouteValue("orderId")
+            .Tag("orders");
     });
 });
 
@@ -182,6 +185,16 @@ app.MapPost("/orders/{orderId:guid}/refresh-cache", async (
     CancellationToken cancellationToken) =>
 {
     await reader.InvalidateAsync(orderId, cancellationToken);
+
+    return Results.NoContent();
+});
+
+app.MapPost("/orders/{orderId:guid}/refresh-output-cache", async (
+    Guid orderId,
+    IOutputCacheStore outputCache,
+    CancellationToken cancellationToken) =>
+{
+    await outputCache.EvictByTagAsync("orders", cancellationToken);
 
     return Results.NoContent();
 });
